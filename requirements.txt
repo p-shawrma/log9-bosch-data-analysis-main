@@ -6,3 +6,4 @@ streamlit
 clickhouse-connect
 pygwalker
 scipy
+asyncio
