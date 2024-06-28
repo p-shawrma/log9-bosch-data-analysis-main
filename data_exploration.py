@@ -22,6 +22,9 @@ st.set_page_config(
 # Add Title
 st.title("Bosch Pack Cycling Data Dashboard")
 
+async def init_wasm():
+    await init("path/to/your/wasm/file.wasm")
+
 # Function to create a new ClickHouse client
 def create_client():
     return clickhouse_connect.get_client(
