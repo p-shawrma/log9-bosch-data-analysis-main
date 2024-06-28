@@ -1,51 +1,215 @@
-# Copyright (c) Streamlit Inc. (2018-2022) Snowflake Inc. (2022)
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import streamlit as st
-from streamlit.logger import get_logger
+import clickhouse_connect
+import pandas as pd
+from pygwalker.api.streamlit import StreamlitRenderer
+from scipy.stats import skew, kurtosis
 
-LOGGER = get_logger(__name__)
+# ClickHouse connection details
+ch_host = 'a84a1hn9ig.ap-south-1.aws.clickhouse.cloud'
+ch_user = 'default'
+ch_password = 'dKd.Y9kFMv06x'
+ch_database = 'test_db'
 
+# Set Streamlit page configuration
+st.set_page_config(
+    page_title="Bosch Pack Cycling Data Dashboard",
+    layout="wide"
+)
 
-def run():
-    st.set_page_config(
-        page_title="Hello",
-        page_icon="👋",
+# Add Title
+st.title("Bosch Pack Cycling Data Dashboard")
+
+# Function to create a new ClickHouse client
+def create_client():
+    return clickhouse_connect.get_client(
+        host=ch_host,
+        port=8443,
+        username=ch_user,
+        password=ch_password,
+        database=ch_database,
+        secure=True
     )
 
-    st.write("# Welcome to Streamlit! 👋")
+# Function to connect to ClickHouse and fetch data
+@st.cache_data
+def fetch_data(query):
+    client = create_client()
+    result = client.query(query)
+    df = pd.DataFrame(result.result_rows, columns=result.column_names)
+    return df
 
-    st.sidebar.success("Select a demo above.")
+# Define queries to fetch data from the three tables
+queries = {
+    "Pack Cycling Step Data": "SELECT *, step_date as date FROM test_db.pack_cycling_step_data",
+    "Pack Cycling Record Data": "SELECT * FROM test_db.pack_cycling_record_data",
+    "Pack Cycling BMS Data": "SELECT * FROM test_db.pack_cycling_bms_data_new"
+}
 
-    st.markdown(
-        """
-        Streamlit is an open-source app framework built specifically for
-        Machine Learning and Data Science projects.
-        **👈 Select a demo from the sidebar** to see some examples
-        of what Streamlit can do!
-        ### Want to learn more?
-        - Check out [streamlit.io](https://streamlit.io)
-        - Jump into our [documentation](https://docs.streamlit.io)
-        - Ask a question in our [community
-          forums](https://discuss.streamlit.io)
-        ### See more complex demos
-        - Use a neural net to [analyze the Udacity Self-driving Car Image
-          Dataset](https://github.com/streamlit/demo-self-driving)
-        - Explore a [New York City rideshare dataset](https://github.com/streamlit/demo-uber-nyc-pickups)
-    """
+# Fetch data from all tables initially
+data_frames = {name: fetch_data(query) for name, query in queries.items()}
+
+# Function to get unique values for filters based on the current filtered DataFrame
+def get_unique_values(df, column):
+    if column in df.columns:
+        return sorted(df[column].dropna().unique())
+    return []
+
+# Sidebar filters
+st.sidebar.header("Filters")
+
+# Initialize session state for filters
+if 'filters' not in st.session_state:
+    st.session_state['filters'] = {
+        'cycle_index': [],
+        'step_type': [],
+        'step_number': [],
+        'pack_id': [],
+        'date': []
+    }
+
+# Function to apply filters
+def apply_filters(df, filters):
+    if filters['cycle_index']:
+        df = df[df['cycle_index'].isin(filters['cycle_index'])]
+    if filters['step_type']:
+        df = df[df['step_type'].isin(filters['step_type'])]
+    if 'step_number' in df.columns and filters['step_number']:
+        df = df[df['step_number'].isin(filters['step_number'])]
+    if filters['pack_id']:
+        df = df[df['pack_id'].isin(filters['pack_id'])]
+    if filters['date']:
+        df = df[df['date'].isin(filters['date'])]
+    return df
+
+# Apply current filters to the DataFrame
+filtered_data_frames = {name: apply_filters(df, st.session_state['filters']) for name, df in data_frames.items()}
+
+# Update filter options based on the filtered DataFrame
+unique_cycle_index = get_unique_values(pd.concat(filtered_data_frames.values()), 'cycle_index')
+unique_step_type = get_unique_values(pd.concat(filtered_data_frames.values()), 'step_type')
+unique_step_number = get_unique_values(pd.concat(filtered_data_frames.values()), 'step_number')
+unique_pack_id = get_unique_values(pd.concat(filtered_data_frames.values()), 'pack_id')
+unique_date = get_unique_values(pd.concat(filtered_data_frames.values()), 'date')
+
+# Multiselect filters
+st.session_state['filters']['cycle_index'] = st.sidebar.multiselect('Select cycle index', options=unique_cycle_index, default=st.session_state['filters']['cycle_index'])
+st.session_state['filters']['step_type'] = st.sidebar.multiselect('Select step type', options=unique_step_type, default=st.session_state['filters']['step_type'])
+st.session_state['filters']['step_number'] = st.sidebar.multiselect('Select step number', options=unique_step_number, default=st.session_state['filters']['step_number'])
+st.session_state['filters']['pack_id'] = st.sidebar.multiselect('Select pack id', options=unique_pack_id, default=st.session_state['filters']['pack_id'])
+st.session_state['filters']['date'] = st.sidebar.multiselect('Select date', options=unique_date, default=st.session_state['filters']['date'])
+
+# Reapply filters to update the filtered DataFrames
+filtered_data_frames = {name: apply_filters(df, st.session_state['filters']) for name, df in data_frames.items()}
+
+# Function to find end_voltage_bms
+def find_end_voltage_bms(row, df_bms_data):
+    match_condition = (
+        (df_bms_data['pack_id'] == row['pack_id']) &
+        (df_bms_data['date'] == row['date']) &
+        (df_bms_data['oneset_date'] == row['oneset_date']) &
+        (df_bms_data['step_type'] == row['step_type']) &
+        (df_bms_data['step_number'] == row['step_number'])
     )
+    matching_rows = df_bms_data[match_condition]
+    if not matching_rows.empty:
+        return matching_rows['sumvoltage'].min()
+    else:
+        return 0
+
+# Add end_voltage_bms to Pack Cycling Step Data
+data_frames['Pack Cycling Step Data']['end_voltage_bms'] = data_frames['Pack Cycling Step Data'].apply(find_end_voltage_bms, axis=1, args=(data_frames['Pack Cycling BMS Data'],))
+
+# Convert end_voltage_bms to float32
+data_frames['Pack Cycling Step Data']['end_voltage_bms'] = data_frames['Pack Cycling Step Data']['end_voltage_bms'].astype('float32')
 
 
-if __name__ == "__main__":
-    run()
+# Calculate computed fields if the required columns are present
+def add_computed_fields(df):
+    cell_voltage_columns = [f'cellv_{i}' for i in range(1, 22)]
+    if all(col in df.columns for col in cell_voltage_columns + ['maxv', 'minv']):
+        # Calculate delta_voltage
+        df['delta_mv'] = (df['maxv'] - df['minv'])*1000
+
+        # Binning minv, maxv, and delta_mv
+        minv_bins = [0, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 3]  # Example bin edges for minv
+        maxv_bins = [0, 1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 3]  # Example bin edges for maxv
+        delta_mv_bins = [0, 20, 40, 60, 80, 100, 120, 140, 160, 180, 200, 300, 400, 1000]  # Example bin edges for delta_mv
+
+        # Create binned columns
+        df['minv_bins'] = pd.cut(df['minv'], bins=minv_bins, labels=[f'{minv_bins[i]}-{minv_bins[i+1]}' for i in range(len(minv_bins)-1)],right=False)
+        df['maxv_bins'] = pd.cut(df['maxv'], bins=maxv_bins, labels=[f'{maxv_bins[i]}-{maxv_bins[i+1]}' for i in range(len(maxv_bins)-1)],right=False)
+        df['delta_mv_bins'] = pd.cut(df['delta_mv'], bins=delta_mv_bins, labels=[f'{delta_mv_bins[i]}-{delta_mv_bins[i+1]}' for i in range(len(delta_mv_bins)-1)],right=False)
+        
+        
+        # Calculate median_cell_voltage
+        df['median_cell_voltage'] = df[cell_voltage_columns].median(axis=1)
+
+        # Calculate average_cell_voltage
+        df['average_cell_voltage'] = df[cell_voltage_columns].mean(axis=1)
+
+        # Calculate 25th percentile cell voltage
+        df['25th_p_cellv'] = df[cell_voltage_columns].quantile(0.25, axis=1)
+
+        # Calculate 75th percentile cell voltage
+        df['75th_p_cellv'] = df[cell_voltage_columns].quantile(0.75, axis=1)
+
+        # Calculate standard deviation of cell voltage
+        df['stdev_cell_v'] = df[cell_voltage_columns].std(axis=1)
+
+        # Calculate minimum cell voltage
+        df['min_cell_voltage'] = df[cell_voltage_columns].min(axis=1)
+
+        # Calculate maximum cell voltage
+        df['max_cell_voltage'] = df[cell_voltage_columns].max(axis=1)
+
+        # Calculate range of cell voltage
+        df['range_cell_voltage'] = df['max_cell_voltage'] - df['min_cell_voltage']
+
+        # Calculate variance of cell voltage
+        df['variance_cell_voltage'] = df[cell_voltage_columns].var(axis=1)
+
+        # Calculate coefficient of variation
+        df['coefficient_of_variation'] = (df['stdev_cell_v'] / df['average_cell_voltage']) * 100
+
+        # Calculate skewness of cell voltage
+        df['skewness'] = df[cell_voltage_columns].apply(lambda row: skew(row), axis=1)
+
+        # Calculate kurtosis of cell voltage
+        df['kurtosis'] = df[cell_voltage_columns].apply(lambda row: kurtosis(row), axis=1)
+
+        # Calculate interquartile range (IQR) of cell voltage
+        df['iqr_cell_voltage'] = df['75th_p_cellv'] - df['25th_p_cellv']
+    return df
+
+# Add computed fields to the filtered data frames
+filtered_data_frames = {name: add_computed_fields(df) for name, df in filtered_data_frames.items()}
+
+# Streamlit tabs for different dataframes
+tab1, tab2, tab3 = st.tabs(["Step Data", "Record Data", "BMS Data"])
+
+with tab1:
+    st.header("Pack Cycling Step Data")
+    st.dataframe(filtered_data_frames["Pack Cycling Step Data"])
+    # Use PyG Walker for data exploration
+
+    vis_spec = r"""{"config":[{"config":{"defaultAggregated":true,"geoms":["table"],"coordSystem":"generic","limit":-1,"timezoneDisplayOffset":0},"encodings":{"dimensions":[{"fid":"primary_id","name":"primary_id","basename":"primary_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"step_number","name":"step_number","basename":"step_number","analyticType":"dimension","semanticType":"nominal","aggName":"sum","offset":0},{"fid":"step_date","name":"step_date","basename":"step_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"cycle_index","name":"cycle_index","basename":"cycle_index","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"step_index","name":"step_index","basename":"step_index","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"step_type","name":"step_type","basename":"step_type","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"step_time","name":"step_time","basename":"step_time","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"oneset_date","name":"oneset_date","basename":"oneset_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"end_date","name":"end_date","basename":"end_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"date","name":"date","basename":"date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"gw_mea_key_fid","name":"Measure names","analyticType":"dimension","semanticType":"nominal"}],"measures":[{"fid":"capacity_ah","name":"capacity_ah","basename":"capacity_ah","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"spec_cap_mah_g","name":"spec_cap_mah_g","basename":"spec_cap_mah_g","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"chg_cap_ah","name":"chg_cap_ah","basename":"chg_cap_ah","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"chg_spec_cap_mah_g","name":"chg_spec_cap_mah_g","basename":"chg_spec_cap_mah_g","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dchg_cap_ah","name":"dchg_cap_ah","basename":"dchg_cap_ah","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dchg_spec_cap_mah_g","name":"dchg_spec_cap_mah_g","basename":"dchg_spec_cap_mah_g","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"net_dchg_cap_ah","name":"net_dchg_cap_ah","basename":"net_dchg_cap_ah","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"energy_wh","name":"energy_wh","basename":"energy_wh","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"spec_energy_mwh_g","name":"spec_energy_mwh_g","basename":"spec_energy_mwh_g","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"chg_energy_wh","name":"chg_energy_wh","basename":"chg_energy_wh","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"chg_spec_energy_mwh_g","name":"chg_spec_energy_mwh_g","basename":"chg_spec_energy_mwh_g","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dchg_energy_wh","name":"dchg_energy_wh","basename":"dchg_energy_wh","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dchg_spec_energy_mwh_g","name":"dchg_spec_energy_mwh_g","basename":"dchg_spec_energy_mwh_g","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"net_dchg_energy_wh","name":"net_dchg_energy_wh","basename":"net_dchg_energy_wh","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"super_capacitor_f","name":"super_capacitor_f","basename":"super_capacitor_f","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"oneset_volt_v","name":"oneset_volt_v","basename":"oneset_volt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"chg_oneset_volt_v","name":"chg_oneset_volt_v","basename":"chg_oneset_volt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dchg_oneset_volt_v","name":"dchg_oneset_volt_v","basename":"dchg_oneset_volt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"end_voltage_v","name":"end_voltage_v","basename":"end_voltage_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"end_of_chgvolt_v","name":"end_of_chgvolt_v","basename":"end_of_chgvolt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"end_of_dchgvolt_v","name":"end_of_dchgvolt_v","basename":"end_of_dchgvolt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"chg_med_volt_v","name":"chg_med_volt_v","basename":"chg_med_volt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dchg_med_volt_v","name":"dchg_med_volt_v","basename":"dchg_med_volt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"starting_current_a","name":"starting_current_a","basename":"starting_current_a","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"end_current_a","name":"end_current_a","basename":"end_current_a","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"dcir_m_ohm","name":"dcir_m_ohm","basename":"dcir_m_ohm","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"end_voltage_bms","name":"end_voltage_bms","basename":"end_voltage_bms","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"gw_count_fid","name":"Row count","analyticType":"measure","semanticType":"quantitative","aggName":"sum","computed":true,"expression":{"op":"one","params":[],"as":"gw_count_fid"}},{"fid":"gw_mea_val_fid","name":"Measure values","analyticType":"measure","semanticType":"quantitative","aggName":"sum"}],"rows":[{"fid":"oneset_date","name":"oneset_date","basename":"oneset_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"step_number","name":"step_number","basename":"step_number","analyticType":"dimension","semanticType":"nominal","aggName":"sum","offset":0}],"columns":[{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"capacity_ah","name":"capacity_ah","basename":"capacity_ah","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"oneset_volt_v","name":"oneset_volt_v","basename":"oneset_volt_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"end_voltage_bms","name":"end_voltage_bms","basename":"end_voltage_bms","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0}],"color":[],"opacity":[],"size":[],"shape":[],"radius":[],"theta":[],"longitude":[],"latitude":[],"geoId":[],"details":[],"filters":[{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"one of","value":["LB05A22J000086"]}},{"fid":"step_type","name":"step_type","basename":"step_type","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"one of","value":["CC DChg"]}},{"fid":"step_number","name":"step_number","basename":"step_number","analyticType":"dimension","semanticType":"nominal","aggName":"sum","offset":0,"rule":{"type":"not in","value":[]}}],"text":[]},"layout":{"showActions":false,"showTableSummary":false,"stack":"stack","interactiveScale":false,"zeroScale":true,"size":{"mode":"auto","width":320,"height":200},"format":{},"geoKey":"name","resolve":{"x":false,"y":false,"color":false,"opacity":false,"shape":false,"size":false}},"visId":"gw_D4Sx","name":"Capacity Table"}],"chart_map":{},"workflow_list":[{"workflow":[{"type":"filter","filters":[{"fid":"pack_id","rule":{"type":"one of","value":["LB05A22J000086"]}},{"fid":"step_type","rule":{"type":"one of","value":["CC DChg"]}},{"fid":"step_number","rule":{"type":"not in","value":[]}}]},{"type":"view","query":[{"op":"aggregate","groupBy":["pack_id","oneset_date","step_number"],"measures":[{"field":"capacity_ah","agg":"sum","asFieldKey":"capacity_ah_sum"},{"field":"oneset_volt_v","agg":"sum","asFieldKey":"oneset_volt_v_sum"},{"field":"end_voltage_bms","agg":"sum","asFieldKey":"end_voltage_bms_sum"}]}]}]}],"version":"0.4.8.9"}"""
+
+    
+    pyg_app_step = StreamlitRenderer(filtered_data_frames["Pack Cycling Step Data"], spec=vis_spec)
+    pyg_app_step.explorer()
+
+with tab2:
+    st.header("Pack Cycling Record Data")
+    st.dataframe(filtered_data_frames["Pack Cycling Record Data"])
+    # Use PyG Walker for data exploration
+    pyg_app_record = StreamlitRenderer(filtered_data_frames["Pack Cycling Record Data"])
+    pyg_app_record.explorer()
+
+with tab3:
+    st.header("Pack Cycling BMS Data")
+    st.dataframe(filtered_data_frames["Pack Cycling BMS Data"])
+    # Define the visualization specification (vis_spec) for the predefined chart
+    vis_spec = r"""{"config":[{"config":{"defaultAggregated":true,"geoms":["table"],"coordSystem":"generic","limit":-1,"timezoneDisplayOffset":0},"encodings":{"dimensions":[{"fid":"primary_id","name":"primary_id","basename":"primary_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"cycle_index","name":"cycle_index","basename":"cycle_index","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"step_type","name":"step_type","basename":"step_type","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"step_number","name":"step_number","basename":"step_number","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"timestamp","name":"timestamp","basename":"timestamp","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"date","name":"date","basename":"date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"time","name":"time","basename":"time","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"chgmos","name":"chgmos","basename":"chgmos","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"dischgmos","name":"dischgmos","basename":"dischgmos","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"serialnum","name":"serialnum","basename":"serialnum","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"tempnum","name":"tempnum","basename":"tempnum","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"maxv_no","name":"maxv_no","basename":"maxv_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"minv_no","name":"minv_no","basename":"minv_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"maxt_no","name":"maxt_no","basename":"maxt_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"mint_no","name":"mint_no","basename":"mint_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode1","name":"errcode1","basename":"errcode1","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode2","name":"errcode2","basename":"errcode2","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode3","name":"errcode3","basename":"errcode3","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode4","name":"errcode4","basename":"errcode4","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode5","name":"errcode5","basename":"errcode5","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode6","name":"errcode6","basename":"errcode6","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode7","name":"errcode7","basename":"errcode7","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode8","name":"errcode8","basename":"errcode8","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"cycletime","name":"cycletime","basename":"cycletime","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"di1","name":"di1","basename":"di1","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"di2","name":"di2","basename":"di2","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"di3","name":"di3","basename":"di3","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"di4","name":"di4","basename":"di4","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do1","name":"do1","basename":"do1","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do2","name":"do2","basename":"do2","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do3","name":"do3","basename":"do3","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do4","name":"do4","basename":"do4","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"boardnum","name":"boardnum","basename":"boardnum","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"oneset_date","name":"oneset_date","basename":"oneset_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"minv_bins","name":"minv_bins","basename":"minv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"maxv_bins","name":"maxv_bins","basename":"maxv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"delta_mv_bins","name":"delta_mv_bins","basename":"delta_mv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"gw_mea_key_fid","name":"Measure names","analyticType":"dimension","semanticType":"nominal"}],"measures":[{"fid":"bms_life","name":"bms_life","basename":"bms_life","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"sumvoltage","name":"sumvoltage","basename":"sumvoltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"current_cycler","name":"current_cycler","basename":"current_cycler","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"current","name":"current","basename":"current","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"soc","name":"soc","basename":"soc","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"remaincap","name":"remaincap","basename":"remaincap","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"maxv","name":"maxv","basename":"maxv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"minv","name":"minv","basename":"minv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"maxt","name":"maxt","basename":"maxt","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"mint","name":"mint","basename":"mint","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_1","name":"cellv_1","basename":"cellv_1","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_2","name":"cellv_2","basename":"cellv_2","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_3","name":"cellv_3","basename":"cellv_3","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_4","name":"cellv_4","basename":"cellv_4","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_5","name":"cellv_5","basename":"cellv_5","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_6","name":"cellv_6","basename":"cellv_6","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_7","name":"cellv_7","basename":"cellv_7","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_8","name":"cellv_8","basename":"cellv_8","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_9","name":"cellv_9","basename":"cellv_9","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_10","name":"cellv_10","basename":"cellv_10","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_11","name":"cellv_11","basename":"cellv_11","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_12","name":"cellv_12","basename":"cellv_12","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_13","name":"cellv_13","basename":"cellv_13","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_14","name":"cellv_14","basename":"cellv_14","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_15","name":"cellv_15","basename":"cellv_15","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_16","name":"cellv_16","basename":"cellv_16","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_17","name":"cellv_17","basename":"cellv_17","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_18","name":"cellv_18","basename":"cellv_18","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_19","name":"cellv_19","basename":"cellv_19","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_20","name":"cellv_20","basename":"cellv_20","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_21","name":"cellv_21","basename":"cellv_21","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"temp_1","name":"temp_1","basename":"temp_1","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"delta_mv","name":"delta_mv","basename":"delta_mv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"median_cell_voltage","name":"median_cell_voltage","basename":"median_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"average_cell_voltage","name":"average_cell_voltage","basename":"average_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"25th_p_cellv","name":"25th_p_cellv","basename":"25th_p_cellv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"75th_p_cellv","name":"75th_p_cellv","basename":"75th_p_cellv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"stdev_cell_v","name":"stdev_cell_v","basename":"stdev_cell_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"min_cell_voltage","name":"min_cell_voltage","basename":"min_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"max_cell_voltage","name":"max_cell_voltage","basename":"max_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"range_cell_voltage","name":"range_cell_voltage","basename":"range_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"variance_cell_voltage","name":"variance_cell_voltage","basename":"variance_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"coefficient_of_variation","name":"coefficient_of_variation","basename":"coefficient_of_variation","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"skewness","name":"skewness","basename":"skewness","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"kurtosis","name":"kurtosis","basename":"kurtosis","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"iqr_cell_voltage","name":"iqr_cell_voltage","basename":"iqr_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"gw_count_fid","name":"Row count","analyticType":"measure","semanticType":"quantitative","aggName":"sum","computed":true,"expression":{"op":"one","params":[],"as":"gw_count_fid"}},{"fid":"gw_mea_val_fid","name":"Measure values","analyticType":"measure","semanticType":"quantitative","aggName":"sum"}],"rows":[{"fid":"minv_bins","name":"minv_bins","basename":"minv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"delta_mv_bins","name":"delta_mv_bins","basename":"delta_mv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"gw_count_fid","name":"Row count","analyticType":"measure","semanticType":"quantitative","aggName":"sum","computed":true,"expression":{"op":"one","params":[],"as":"gw_count_fid"}}],"columns":[{"fid":"minv_no","name":"minv_no","basename":"minv_no","semanticType":"quantitative","analyticType":"dimension","offset":0}],"color":[],"opacity":[],"size":[],"shape":[],"radius":[],"theta":[],"longitude":[],"latitude":[],"geoId":[],"details":[],"filters":[{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"one of","value":["LB05A22M000097"]}},{"fid":"step_type","name":"step_type","basename":"step_type","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"one of","value":["CC DChg"]}},{"fid":"step_number","name":"step_number","basename":"step_number","semanticType":"quantitative","analyticType":"dimension","offset":0,"rule":{"type":"not in","value":[]}},{"fid":"delta_mv","name":"delta_mv","basename":"delta_mv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0,"rule":{"type":"range","value":[2.000093460083008,358.00015926361084]}},{"fid":"delta_mv_bins","name":"delta_mv_bins","basename":"delta_mv_bins","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"not in","value":[]}},{"fid":"soc","name":"soc","basename":"soc","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0,"rule":{"type":"range","value":[0,100]}}],"text":[]},"layout":{"showActions":false,"showTableSummary":false,"stack":"stack","interactiveScale":false,"zeroScale":true,"size":{"mode":"auto","width":320,"height":200},"format":{},"geoKey":"name","resolve":{"x":false,"y":false,"color":false,"opacity":false,"shape":false,"size":false}},"visId":"gw_6hRm","name":"Cell String minV occurence"},{"config":{"defaultAggregated":false,"geoms":["point"],"coordSystem":"generic","limit":-1,"timezoneDisplayOffset":0},"encodings":{"dimensions":[{"fid":"primary_id","name":"primary_id","basename":"primary_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"cycle_index","name":"cycle_index","basename":"cycle_index","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"step_type","name":"step_type","basename":"step_type","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"step_number","name":"step_number","basename":"step_number","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"timestamp","name":"timestamp","basename":"timestamp","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"date","name":"date","basename":"date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"time","name":"time","basename":"time","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"chgmos","name":"chgmos","basename":"chgmos","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"dischgmos","name":"dischgmos","basename":"dischgmos","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"serialnum","name":"serialnum","basename":"serialnum","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"tempnum","name":"tempnum","basename":"tempnum","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"maxv_no","name":"maxv_no","basename":"maxv_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"minv_no","name":"minv_no","basename":"minv_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"maxt_no","name":"maxt_no","basename":"maxt_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"mint_no","name":"mint_no","basename":"mint_no","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode1","name":"errcode1","basename":"errcode1","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode2","name":"errcode2","basename":"errcode2","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode3","name":"errcode3","basename":"errcode3","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode4","name":"errcode4","basename":"errcode4","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode5","name":"errcode5","basename":"errcode5","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode6","name":"errcode6","basename":"errcode6","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode7","name":"errcode7","basename":"errcode7","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"errcode8","name":"errcode8","basename":"errcode8","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"cycletime","name":"cycletime","basename":"cycletime","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"di1","name":"di1","basename":"di1","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"di2","name":"di2","basename":"di2","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"di3","name":"di3","basename":"di3","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"di4","name":"di4","basename":"di4","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do1","name":"do1","basename":"do1","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do2","name":"do2","basename":"do2","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do3","name":"do3","basename":"do3","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"do4","name":"do4","basename":"do4","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"boardnum","name":"boardnum","basename":"boardnum","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"oneset_date","name":"oneset_date","basename":"oneset_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"minv_bins","name":"minv_bins","basename":"minv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"maxv_bins","name":"maxv_bins","basename":"maxv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"delta_mv_bins","name":"delta_mv_bins","basename":"delta_mv_bins","semanticType":"nominal","analyticType":"dimension","offset":0},{"fid":"gw_mea_key_fid","name":"Measure names","analyticType":"dimension","semanticType":"nominal"}],"measures":[{"fid":"bms_life","name":"bms_life","basename":"bms_life","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"sumvoltage","name":"sumvoltage","basename":"sumvoltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"current_cycler","name":"current_cycler","basename":"current_cycler","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"current","name":"current","basename":"current","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"soc","name":"soc","basename":"soc","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"remaincap","name":"remaincap","basename":"remaincap","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"maxv","name":"maxv","basename":"maxv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"minv","name":"minv","basename":"minv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"maxt","name":"maxt","basename":"maxt","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"mint","name":"mint","basename":"mint","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_1","name":"cellv_1","basename":"cellv_1","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_2","name":"cellv_2","basename":"cellv_2","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_3","name":"cellv_3","basename":"cellv_3","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_4","name":"cellv_4","basename":"cellv_4","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_5","name":"cellv_5","basename":"cellv_5","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_6","name":"cellv_6","basename":"cellv_6","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_7","name":"cellv_7","basename":"cellv_7","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_8","name":"cellv_8","basename":"cellv_8","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_9","name":"cellv_9","basename":"cellv_9","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_10","name":"cellv_10","basename":"cellv_10","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_11","name":"cellv_11","basename":"cellv_11","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_12","name":"cellv_12","basename":"cellv_12","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_13","name":"cellv_13","basename":"cellv_13","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_14","name":"cellv_14","basename":"cellv_14","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_15","name":"cellv_15","basename":"cellv_15","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_16","name":"cellv_16","basename":"cellv_16","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_17","name":"cellv_17","basename":"cellv_17","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_18","name":"cellv_18","basename":"cellv_18","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_19","name":"cellv_19","basename":"cellv_19","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_20","name":"cellv_20","basename":"cellv_20","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"cellv_21","name":"cellv_21","basename":"cellv_21","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"temp_1","name":"temp_1","basename":"temp_1","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"delta_mv","name":"delta_mv","basename":"delta_mv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"median_cell_voltage","name":"median_cell_voltage","basename":"median_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"average_cell_voltage","name":"average_cell_voltage","basename":"average_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"25th_p_cellv","name":"25th_p_cellv","basename":"25th_p_cellv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"75th_p_cellv","name":"75th_p_cellv","basename":"75th_p_cellv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"stdev_cell_v","name":"stdev_cell_v","basename":"stdev_cell_v","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"min_cell_voltage","name":"min_cell_voltage","basename":"min_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"max_cell_voltage","name":"max_cell_voltage","basename":"max_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"range_cell_voltage","name":"range_cell_voltage","basename":"range_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"variance_cell_voltage","name":"variance_cell_voltage","basename":"variance_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"coefficient_of_variation","name":"coefficient_of_variation","basename":"coefficient_of_variation","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"skewness","name":"skewness","basename":"skewness","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"kurtosis","name":"kurtosis","basename":"kurtosis","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"iqr_cell_voltage","name":"iqr_cell_voltage","basename":"iqr_cell_voltage","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0},{"fid":"gw_count_fid","name":"Row count","analyticType":"measure","semanticType":"quantitative","aggName":"sum","computed":true,"expression":{"op":"one","params":[],"as":"gw_count_fid"}},{"fid":"gw_mea_val_fid","name":"Measure values","analyticType":"measure","semanticType":"quantitative","aggName":"sum"}],"rows":[{"fid":"step_number","name":"step_number","basename":"step_number","semanticType":"quantitative","analyticType":"dimension","offset":0},{"fid":"delta_mv","name":"delta_mv","basename":"delta_mv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0}],"columns":[{"fid":"oneset_date","name":"oneset_date","basename":"oneset_date","semanticType":"temporal","analyticType":"dimension","offset":0},{"fid":"soc","name":"soc","basename":"soc","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0}],"color":[],"opacity":[],"size":[],"shape":[],"radius":[],"theta":[],"longitude":[],"latitude":[],"geoId":[],"details":[],"filters":[{"fid":"step_type","name":"step_type","basename":"step_type","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"one of","value":["CC DChg"]}},{"fid":"pack_id","name":"pack_id","basename":"pack_id","semanticType":"nominal","analyticType":"dimension","offset":0,"rule":{"type":"one of","value":["LB05A22J000086"]}},{"fid":"maxv","name":"maxv","basename":"maxv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0,"rule":{"type":"range","value":[1.871000051498413,2.4]}},{"fid":"minv","name":"minv","basename":"minv","analyticType":"measure","semanticType":"quantitative","aggName":"sum","offset":0,"rule":{"type":"range","value":[2,2.559000015258789]}}],"text":[]},"layout":{"showActions":false,"showTableSummary":false,"stack":"stack","interactiveScale":false,"zeroScale":true,"size":{"mode":"auto","width":320,"height":200},"format":{},"geoKey":"name","resolve":{"x":false,"y":false,"color":false,"opacity":false,"shape":false,"size":false}},"visId":"gw_yDNm","name":"Delta Voltage curve"}],"chart_map":{},"workflow_list":[{"workflow":[{"type":"filter","filters":[{"fid":"pack_id","rule":{"type":"one of","value":["LB05A22M000097"]}},{"fid":"step_type","rule":{"type":"one of","value":["CC DChg"]}},{"fid":"step_number","rule":{"type":"not in","value":[]}},{"fid":"delta_mv","rule":{"type":"range","value":[2.000093460083008,358.00015926361084]}},{"fid":"delta_mv_bins","rule":{"type":"not in","value":[]}},{"fid":"soc","rule":{"type":"range","value":[0,100]}}]},{"type":"transform","transform":[{"key":"gw_count_fid","expression":{"op":"one","params":[],"as":"gw_count_fid"}}]},{"type":"view","query":[{"op":"aggregate","groupBy":["minv_no","minv_bins","delta_mv_bins"],"measures":[{"field":"gw_count_fid","agg":"sum","asFieldKey":"gw_count_fid_sum"}]}]}]},{"workflow":[{"type":"filter","filters":[{"fid":"step_type","rule":{"type":"one of","value":["CC DChg"]}},{"fid":"pack_id","rule":{"type":"one of","value":["LB05A22J000086"]}},{"fid":"maxv","rule":{"type":"range","value":[1.871000051498413,2.4]}},{"fid":"minv","rule":{"type":"range","value":[2,2.559000015258789]}}]},{"type":"view","query":[{"op":"raw","fields":["oneset_date","step_number","soc","delta_mv"]}]}]}],"version":"0.4.8.9"}"""
+   
+    pyg_app_bms = StreamlitRenderer(filtered_data_frames["Pack Cycling BMS Data"], spec=vis_spec)
+    pyg_app_bms.explorer()
